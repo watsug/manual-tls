@@ -1,4 +1,10 @@
+import base64
+
 from abc import ABC, abstractmethod
+from enum import IntEnum
+from hashlib import sha256
+from ecdsa import VerifyingKey
+from ecdsa.util import sigdecode_der
 
 # in tls 1.3 the version tls 1.2 is sent for better compatibility
 LEGACY_TLS_VERSION = b"\x03\x03"
@@ -9,6 +15,80 @@ ALERT = b"\x15"
 HANDSHAKE = b"\x16"
 APPLICATION_DATA = b"\x17"
 
+class HandshakeType(IntEnum):
+    HELLO_REQUEST = 0
+    CLIENT_HELLO = 1
+    SERVER_HELLO = 2
+    HELLO_VERIFY_REQUEST = 3
+    NEW_SESSION_TICKET = 4
+    END_OF_EARLY_DATA = 5
+    HELLO_RETRY_REQUEST = 6
+    ENCRYPTED_EXTENSIONS = 8
+    CERTIFICATE = 11
+    SERVER_KEY_EXCHANGE = 12
+    CERTIFICATE_REQUEST = 13
+    SERVER_HELLO_DONE = 14
+    CERTIFICATE_VERIFY = 15
+    CLIENT_KEY_EXCHANGE = 16
+    FINISHED = 20
+    CERTIFICATE_URL = 21
+    CERTIFICATE_STATUS = 22
+    SUPPLEMENTAL_DATA = 23
+    KEY_UPDATE = 24
+    MESSAGE_HASH = 254
+
+class ExtensionType(IntEnum):
+    SERVER_NAME = 0                             # RFC 6066
+    MAX_FRAGMENT_LENGTH = 1                     # RFC 6066
+    STATUS_REQUEST = 5                          # RFC 6066
+    SUPPORTED_GROUPS = 10                       # RFC 8422, 7919
+    SIGNATURE_ALGORITHMS = 13                   # RFC 8446
+    USE_SRTP = 14                               # RFC 5764
+    HEARTBEAT = 15                              # RFC 6520
+    APPLICATION_LAYER_PROTOCOL_NEGOTIATION = 16 # RFC 7301
+    SIGNED_CERTIFICATE_TIMESTAMP = 18           # RFC 6962
+    CLIENT_CERTIFICATE_TYPE = 19                # RFC 7250
+    SERVER_CERTIFICATE_TYPE = 20                # RFC 7250
+    PADDING = 21                                # RFC 7685
+    PRE_SHARED_KEY = 41                         # RFC 8446
+    EARLY_DATA = 42                             # RFC 8446
+    SUPPORTED_VERSIONS = 43                     # RFC 8446
+    COOKIE = 44                                 # RFC 8446
+    PSK_KEY_EXCHANGE_MODES = 45                 # RFC 8446
+    CERTIFICATE_AUTHORITIES = 47                # RFC 8446
+    OID_FILTERS = 48                            # RFC 8446
+    POST_HANDSHAKE_AUTH = 49                    # RFC 8446
+    SIGNATURE_ALGORITHMS_CERT = 50              # RFC 8446
+    KEY_SHARE = 51                              # RFC 8446
+
+class SignatureScheme(IntEnum):
+          # RSASSA-PKCS1-v1_5 algorithms
+          RSA_PKCS1_SHA256 = 0X0401
+          RSA_PKCS1_SHA384 = 0X0501
+          RSA_PKCS1_SHA512 = 0X0601
+
+          # ECDSA algorithms
+          ECDSA_SECP256R1_SHA256 = 0X0403
+          ECDSA_SECP384R1_SHA384 = 0X0503
+          ECDSA_SECP521R1_SHA512 = 0X0603          
+
+          # RSASSA-PSS algorithms with public key OID rsaEncryption
+          RSA_PSS_RSAE_SHA256 = 0X0804
+          RSA_PSS_RSAE_SHA384 = 0X0805
+          RSA_PSS_RSAE_SHA512 = 0X0806
+
+          # EdDSA algorithms
+          ED25519 = 0X0807
+          ED448 = 0X0808
+
+          # RSASSA-PSS algorithms with public key OID RSASSA-PSS
+          RSA_PSS_PSS_SHA256 = 0X0809
+          RSA_PSS_PSS_SHA384 = 0X080A
+          RSA_PSS_PSS_SHA512 = 0X080B
+
+          # Legacy algorithms
+          RSA_PKCS1_SHA1 = 0X0201
+          ECDSA_SHA1 = 0X0203
 
 # BYTE MANIPULATION HELPERS
 def bytes_to_num(b):
@@ -160,44 +240,10 @@ def aes128_gcm_encrypt(key, msg, nonce, associated_data):
     tag = aes128_ctr_encrypt(key, pretag, nonce, counter_start_val=1)
     return encrypted_msg + tag
 
-
-# CRYPTOGRAPHIC HASH FUNCTIONS AND MESSAGE AUTHENTICATION CODES
-SHA256_K = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
-]
-
-
-def sha256(msg):
-    msg += b"\x80" + b"\x00" * ((64-(len(msg) + 1 + 8)) % 64) + num_to_bytes(len(msg)*8, 8)
-
-    ss = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]
-    for pos in range(0, len(msg), 64):
-        chunk = msg[pos:pos + 64]
-
-        w = [bytes_to_num(chunk[4*i:4*i+4]) for i in range(16)]
-        for i in range(16, 64):
-            a = rotr(w[i-15], 7) ^ rotr(w[i-15], 18) ^ (w[i-15] >> 3)
-            b = rotr(w[i-2], 17) ^ rotr(w[i-2], 19) ^ (w[i-2] >> 10)
-            w.append((a + b + w[i-16] + w[i-7]) & 0xffffffff)
-
-        s = ss.copy()
-        for i in range(64):
-            c = (s[4] & s[5]) ^ ((s[4] ^ 0xffffffff) & s[6])
-            t = SHA256_K[i] + s[7] + c + w[i] + (rotr(s[4], 6) ^ rotr(s[4], 11) ^ rotr(s[4], 25))
-            q = rotr(s[0], 2) ^ rotr(s[0], 13) ^ rotr(s[0], 22)
-            m = (s[0] & s[1]) ^ (s[0] & s[2]) ^ (s[1] & s[2])
-            s = [(q + m + t) & 0xffffffff, s[0], s[1], s[2], (s[3] + t) & 0xffffffff, s[4], s[5], s[6]]
-
-        ss = [(ss[i] + s[i]) & 0xffffffff for i in range(8)]
-    return b"".join(num_to_bytes(a, 4) for a in ss)
-
+def one_shot_sha256(data):
+    m = sha256()
+    m.update(data)
+    return m.digest()
 
 def hmac_sha256(key, data):
     BLOCK_SIZE = 512 // 8
@@ -207,8 +253,8 @@ def hmac_sha256(key, data):
     if len(key) <= BLOCK_SIZE:
         key += b"\x00" * (BLOCK_SIZE - len(key))
     else:
-        key = sha256(key)
-    return sha256(xor(key, OPAD) + sha256(xor(key, IPAD) + data))
+        key = one_shot_sha256(key)
+    return one_shot_sha256(xor(key, OPAD) + one_shot_sha256(xor(key, IPAD) + data))
 
 
 def derive_secret(label, key, data, hash_len):
@@ -280,6 +326,38 @@ def do_authenticated_decryption(key, nonce_start, seq_num, msg_type, payload):
     msg_type, msg_data = msg[-1:], msg[:-1]
     return msg_type, msg_data
 
+class Extension:
+    def __init__(self, type, value) -> None:
+        self.type = type
+        self.value = value    
+
+class Parser:    
+    def __init__(self, buffer : bytes, offset = 0) -> None:
+        self.buffer = buffer
+        self.offset = offset
+
+    def get_uint8(self):
+        v = self.buffer[self.offset]
+        self.offset += 1
+        return v
+
+    def get_uint16(self):
+        v = bytes_to_num(self.buffer[self.offset : self.offset + 2])
+        self.offset += 2
+        return v
+
+    def get_uint24(self):
+        v = bytes_to_num(self.buffer[self.offset : self.offset + 3])
+        self.offset += 3
+        return v
+
+    def get_data(self, len):
+        v = self.buffer[self.offset : self.offset + len]
+        self.offset += len
+        return v
+
+    def bytes_left(self):
+        return len(self.buffer) - self.offset
 
 class ManualComm(ABC):
     @abstractmethod
@@ -294,6 +372,9 @@ class ManualComm(ABC):
 class ManualTls:
     def __init__(self, comm: ManualComm) -> None:
         self.comm = comm
+        self.server_certificate_type = 0
+        self.client_certificate_type = 0
+        self.signature_algorithms = []
     
     # NETWORK AND LOW LEVEL TLS PROTOCOL HELPERS
     def recv_num_bytes(self, num):
@@ -329,7 +410,15 @@ class ManualTls:
         assert rec_type == APPLICATION_DATA
 
         msg_type, msg = do_authenticated_decryption(key, nonce, seq_num, APPLICATION_DATA, encrypted_msg)
+        print(f"Received handshake type: {msg[0]} ({HandshakeType(msg[0]).name})")
         return msg_type, msg
+
+    def parse_extension(self, buff, offset):
+        type = bytes_to_num(buff[offset : offset + 2])
+        len = bytes_to_num(buff[offset + 2 : offset + 4])
+        value = buff[offset + 4 : offset + 4 + len]
+        
+        return type, len, value
 
 
     # PACKET GENERATORS AND HANDLERS
@@ -473,57 +562,117 @@ class ManualTls:
 
 
     def handle_encrypted_extensions(self, msg):
-        ENCRYPTED_EXTENSIONS = 0x8
-
-        assert msg[0] == ENCRYPTED_EXTENSIONS
+        assert msg[0] == HandshakeType.ENCRYPTED_EXTENSIONS
         extensions_length = bytes_to_num(msg[1:4])
         assert len(msg[4:]) >= extensions_length
-        # ignore the rest
+        
+        offset = 4
+        extensions_length = bytes_to_num(msg[offset:offset + 2])
+        offset += 2
+        while extensions_length > 0:
+            type, length, value = self.parse_extension(msg, offset)
+            offset += length + 4
+            extensions_length -= length + 4
+            
+            print(f"        Encrypted_Extension: {ExtensionType(type).name} - {value.hex()}")
+
+            if type == ExtensionType.SERVER_CERTIFICATE_TYPE:
+                self.server_certificate_type = value[0]
+            elif type == ExtensionType.CLIENT_CERTIFICATE_TYPE:
+                self.client_certificate_type = value[0]
+
+
+    def handle_cert_request(self, cert_request_data):
+        offset = 0
+        handshake_type = cert_request_data[offset]
+        offset += 1
+
+        assert handshake_type == HandshakeType.CERTIFICATE_REQUEST
+
+        extensions_length = bytes_to_num(cert_request_data[1:4])
+        offset += 3
+        assert len(cert_request_data[4:]) >= extensions_length
+
+        self.client_certificate_ctx = b""
+        context_len = cert_request_data[offset]
+        offset += 1
+        if context_len > 0:
+            self.client_certificate_ctx = cert_request_data[offset : offset+context_len]
+            offset += context_len
+        
+        extensions_length = bytes_to_num(cert_request_data[offset:offset + 2])
+        offset += 2
+        while extensions_length > 0:
+            type, length, value = self.parse_extension(cert_request_data, offset)
+            offset += length + 4
+            extensions_length -= length + 4
+            
+            print(f"        Cert_request_extension: {ExtensionType(type).name} - {value.hex()}")
+
+            if type == ExtensionType.SIGNATURE_ALGORITHMS:
+                sig_scheme_length = bytes_to_num(value[:2])
+                pos = 0
+                while pos < sig_scheme_length:
+                    alg = bytes_to_num(value[2 + pos : 2 + pos + 2])
+                    pos += 2
+                    self.signature_algorithms.append(alg)
+
+        for alg in self.signature_algorithms:
+            print(f"            Signature_alg: {hex(alg)} ({SignatureScheme(alg).name})")
 
 
     def handle_server_cert(self, server_cert_data):
-        handshake_type = server_cert_data[0]
+        p = Parser(server_cert_data)
+        
+        handshake_type = p.get_uint8()
+        assert handshake_type == HandshakeType.CERTIFICATE
 
-        CERTIFICATE = 0x0b
-        assert handshake_type == CERTIFICATE
-
-        certificate_field_len = bytes_to_num(server_cert_data[1:4])
+        certificate_field_len = p.get_uint24()
+        assert certificate_field_len == p.bytes_left()
 
         certificates = []
 
-        cert_string_left = server_cert_data[4: 4 + certificate_field_len]
-        while cert_string_left:
-            #cert_type = cert_string_left[0]
-            _ = cert_string_left[0]
-            cert_entry_len = bytes_to_num(cert_string_left[1:4])
+        cert_request_context_length = p.get_uint8()
+        if cert_request_context_length > 0:
+            # not used now
+            _ = p.get_data(cert_request_context_length)
 
-            cert_len = bytes_to_num(cert_string_left[4:7])
+        certificate_field_len = p.get_uint24()
 
-            certificates.append(cert_string_left[7: 7 + cert_len])
-            cert_string_left = cert_string_left[4 + cert_entry_len:]
+        while p.bytes_left() > 0:
+            cert_len = p.get_uint24()
+            cert = p.get_data(cert_len)
+            print(f"cert: {cert.hex()}")
+            certificates.append(cert)
+            
+            # skip extensions
+            ext_len = p.get_uint16()
+            if ext_len > 0:
+                _ = p.get_data(ext_len)
+            
         return certificates
 
-
     def handle_cert_verify(self, cert_verify_data, rsa, msgs_so_far):
-        handshake_type = cert_verify_data[0]
+        p = Parser(cert_verify_data)
+        
+        handshake_type = p.get_uint8()
+        assert handshake_type == HandshakeType.CERTIFICATE_VERIFY
 
-        CERTIFICATE_VERIFY = 0x0f
-        assert handshake_type == CERTIFICATE_VERIFY
+        cert_verify_len = p.get_uint24()
+        assert cert_verify_len == p.bytes_left()
 
-        cert_verify_len = bytes_to_num(cert_verify_data[1:4])
-        assert len(cert_verify_data[4:]) >= cert_verify_len
+        algorithm = p.get_uint16()
+        print(f"        algorithm: {hex(algorithm)} ({SignatureScheme(algorithm).name})")
+        signature_len = p.get_uint16()
+        signature = p.get_data(signature_len)
+        print(f"        signature: {signature.hex()}")
+        print(f"        msgs_so_far: {msgs_so_far.hex()}")
 
-        cert_verify_method = cert_verify_data[4:6]
-        signature_len = bytes_to_num(cert_verify_data[6:8])
-        signature = cert_verify_data[8: 8+signature_len]
+        tbs = b" " * 64 + b"TLS 1.3, server CertificateVerify" + b"\x00" + one_shot_sha256(msgs_so_far)
 
-        message = b" " * 64 + b"TLS 1.3, server CertificateVerify" + b"\x00" + sha256(msgs_so_far)
-
-        # try:
-        #     pss.new(rsa).verify(SHA256.new(message), signature)
-        # except ValueError:
-        #     return False
-        return True
+        pub_key = VerifyingKey.from_der(self.server_certs[0])
+        valid = pub_key.verify(signature, tbs, sha256, sigdecode=sigdecode_der)
+        return valid
 
 
     def handle_finished(self, finished_data, server_finished_key, msgs_so_far):
@@ -535,7 +684,7 @@ class ManualTls:
         verify_data_len = bytes_to_num(finished_data[1:4])
         verify_data = finished_data[4:4+verify_data_len]
 
-        hmac_digest = hmac_sha256(server_finished_key, sha256(msgs_so_far))
+        hmac_digest = hmac_sha256(server_finished_key, one_shot_sha256(msgs_so_far))
         return verify_data == hmac_digest
 
 
@@ -550,6 +699,7 @@ class ManualTls:
 
         return do_authenticated_encryption(client_write_key, client_write_iv, client_seq_num,
                                         HANDSHAKE, msg)
+
 
     def establish(self):
         print("Generating params for a client hello, the first message of TLS handshake")
@@ -592,15 +742,18 @@ class ManualTls:
         rec_type, server_change_cipher = self.recv_tls()
         assert rec_type == CHANGE_CIPHER
 
+        self.server_ecdh_pubkey_x = server_ecdh_pubkey_x
+        self.server_ecdh_pubkey_y = server_ecdh_pubkey_y
+
         our_secret_point_x = multiply_num_on_ec_point(our_ecdh_privkey, server_ecdh_pubkey_x, server_ecdh_pubkey_y,
                                                     SECP256R1_A, SECP256R1_P)[0]
         our_secret = num_to_bytes(our_secret_point_x, 32)
         print(f"    Our common ECDH secret is: {our_secret.hex()}, deriving keys")
 
         early_secret = hmac_sha256(key=b"", data=b"\x00" * 32)
-        preextractsec = derive_secret(b"derived", key=early_secret, data=sha256(b""), hash_len=32)
+        preextractsec = derive_secret(b"derived", key=early_secret, data=one_shot_sha256(b""), hash_len=32)
         handshake_secret = hmac_sha256(key=preextractsec, data=our_secret)
-        hello_hash = sha256(client_hello + server_hello)
+        hello_hash = one_shot_sha256(client_hello + server_hello)
         server_hs_secret = derive_secret(b"s hs traffic", key=handshake_secret, data=hello_hash, hash_len=32)
         server_write_key = derive_secret(b"key", key=server_hs_secret, data=b"", hash_len=16)
         server_write_iv = derive_secret(b"iv", key=server_hs_secret, data=b"", hash_len=12)
@@ -624,8 +777,10 @@ class ManualTls:
         assert rec_type == HANDSHAKE
         server_seq_num += 1
 
-        print(f"    Encrypted_extensions: {encrypted_extensions.hex()}, parsing skipped")
+        print(f"    Encrypted_extensions: {encrypted_extensions.hex()}")
         self.handle_encrypted_extensions(encrypted_extensions)
+
+        msgs_so_far = client_hello + server_hello + encrypted_extensions
 
         ###########################
         print("Receiving server certificates")
@@ -633,8 +788,23 @@ class ManualTls:
         assert rec_type == HANDSHAKE
         server_seq_num += 1
 
-        certs = self.handle_server_cert(server_cert)
-        print(f"    Got {len(certs)} certs")
+        if server_cert[0] == HandshakeType.CERTIFICATE_REQUEST:
+            print(f"    Certificate_request: {server_cert.hex()}")
+
+            self.handle_cert_request(server_cert)
+            
+            msgs_so_far = msgs_so_far + server_cert
+            
+            rec_type, server_cert = self.recv_tls_and_decrypt(server_write_key, server_write_iv, server_seq_num)
+            assert rec_type == HANDSHAKE
+            server_seq_num += 1
+
+        print(f"    Certificate: {server_cert.hex()}")
+
+        self.server_certs = self.handle_server_cert(server_cert)
+        print(f"    Got {len(self.server_certs)} certs")
+
+        msgs_so_far = msgs_so_far + server_cert
 
         ###########################
         print("Receiving server verify certificate")
@@ -642,9 +812,12 @@ class ManualTls:
         assert rec_type == HANDSHAKE
         server_seq_num += 1
 
-        msgs_so_far = client_hello + server_hello + encrypted_extensions + server_cert
+        print(f"    Certificate_verify: {cert_verify.hex()}")
+
         cert_ok = self.handle_cert_verify(cert_verify, None, msgs_so_far)
-        print("    Certificate verifying skipped")
+        print(f"    Certificate verifying ststus: {cert_ok}")
+        if not cert_ok:
+            raise Exception("Unable to verify server certificate!") 
 
         ###########################
         print("Receiving server finished")
@@ -654,7 +827,7 @@ class ManualTls:
 
         msgs_so_far = msgs_so_far + cert_verify
         srv_finish_ok = self.handle_finished(finished, server_finished_key, msgs_so_far)
-        if not srv_finish_ok:
+        if srv_finish_ok:
             print("    Server sent valid finish handshake msg")
         else:
             print("    Warning: Server sent wrong handshake finished msg")
@@ -666,7 +839,7 @@ class ManualTls:
         ###########################
         # All client messages beyond this point are encrypted
         msgs_so_far = msgs_so_far + finished
-        msgs_sha256 = sha256(msgs_so_far)
+        msgs_sha256 = one_shot_sha256(msgs_so_far)
         client_finish_val = hmac_sha256(client_finished_key, msgs_sha256)
 
         print("Handshake: sending an encrypted finished msg")
@@ -680,8 +853,8 @@ class ManualTls:
 
         ###########################
         # rederive application secrets
-        msgs_so_far_hash = sha256(msgs_so_far)
-        premaster_secret = derive_secret(b"derived", data=sha256(b""), key=handshake_secret, hash_len=32)
+        msgs_so_far_hash = one_shot_sha256(msgs_so_far)
+        premaster_secret = derive_secret(b"derived", data=one_shot_sha256(b""), key=handshake_secret, hash_len=32)
         master_secret = hmac_sha256(key=premaster_secret, data=b"\x00" * 32)
         server_secret = derive_secret(b"s ap traffic", data=msgs_so_far_hash, key=master_secret, hash_len=32)
         self.server_write_key = derive_secret(b"key", data=b"", key=server_secret, hash_len=16)
