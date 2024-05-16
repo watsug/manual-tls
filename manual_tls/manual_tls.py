@@ -3,7 +3,7 @@ import base64
 from abc import ABC, abstractmethod
 from enum import IntEnum
 from hashlib import sha256
-from ecdsa import VerifyingKey
+from ecdsa import VerifyingKey, SigningKey, NIST256p
 from ecdsa.util import sigdecode_der
 
 # in tls 1.3 the version tls 1.2 is sent for better compatibility
@@ -62,33 +62,33 @@ class ExtensionType(IntEnum):
     KEY_SHARE = 51                              # RFC 8446
 
 class SignatureScheme(IntEnum):
-          # RSASSA-PKCS1-v1_5 algorithms
-          RSA_PKCS1_SHA256 = 0X0401
-          RSA_PKCS1_SHA384 = 0X0501
-          RSA_PKCS1_SHA512 = 0X0601
+    # RSASSA-PKCS1-v1_5 algorithms
+    RSA_PKCS1_SHA256 = 0X0401
+    RSA_PKCS1_SHA384 = 0X0501
+    RSA_PKCS1_SHA512 = 0X0601
 
-          # ECDSA algorithms
-          ECDSA_SECP256R1_SHA256 = 0X0403
-          ECDSA_SECP384R1_SHA384 = 0X0503
-          ECDSA_SECP521R1_SHA512 = 0X0603          
+    # ECDSA algorithms
+    ECDSA_SECP256R1_SHA256 = 0X0403
+    ECDSA_SECP384R1_SHA384 = 0X0503
+    ECDSA_SECP521R1_SHA512 = 0X0603          
 
-          # RSASSA-PSS algorithms with public key OID rsaEncryption
-          RSA_PSS_RSAE_SHA256 = 0X0804
-          RSA_PSS_RSAE_SHA384 = 0X0805
-          RSA_PSS_RSAE_SHA512 = 0X0806
+    # RSASSA-PSS algorithms with public key OID rsaEncryption
+    RSA_PSS_RSAE_SHA256 = 0X0804
+    RSA_PSS_RSAE_SHA384 = 0X0805
+    RSA_PSS_RSAE_SHA512 = 0X0806
 
-          # EdDSA algorithms
-          ED25519 = 0X0807
-          ED448 = 0X0808
+    # EdDSA algorithms
+    ED25519 = 0X0807
+    ED448 = 0X0808
 
-          # RSASSA-PSS algorithms with public key OID RSASSA-PSS
-          RSA_PSS_PSS_SHA256 = 0X0809
-          RSA_PSS_PSS_SHA384 = 0X080A
-          RSA_PSS_PSS_SHA512 = 0X080B
+    # RSASSA-PSS algorithms with public key OID RSASSA-PSS
+    RSA_PSS_PSS_SHA256 = 0X0809
+    RSA_PSS_PSS_SHA384 = 0X080A
+    RSA_PSS_PSS_SHA512 = 0X080B
 
-          # Legacy algorithms
-          RSA_PKCS1_SHA1 = 0X0201
-          ECDSA_SHA1 = 0X0203
+    # Legacy algorithms
+    RSA_PKCS1_SHA1 = 0X0201
+    ECDSA_SHA1 = 0X0203
 
 # BYTE MANIPULATION HELPERS
 def bytes_to_num(b):
@@ -361,6 +361,10 @@ class Parser:
 
 class ManualComm(ABC):
     @abstractmethod
+    def prepare_send(self, data) -> None:
+        pass
+    
+    @abstractmethod
     def sendall(self, data) -> None:
         pass
 
@@ -400,6 +404,10 @@ class ManualTls:
         return rec_type, rec
 
 
+    def prepare_send_tls(self, rec_type, msg):
+        tls_record = rec_type + LEGACY_TLS_VERSION + num_to_bytes(len(msg), 2) + msg
+        self.comm.prepare_send(tls_record)
+        
     def send_tls(self, rec_type, msg):
         tls_record = rec_type + LEGACY_TLS_VERSION + num_to_bytes(len(msg), 2) + msg
         self.comm.sendall(tls_record)
@@ -670,16 +678,19 @@ class ManualTls:
 
         tbs = b" " * 64 + b"TLS 1.3, server CertificateVerify" + b"\x00" + one_shot_sha256(msgs_so_far)
 
-        pub_key = VerifyingKey.from_der(self.server_certs[0])
-        valid = pub_key.verify(signature, tbs, sha256, sigdecode=sigdecode_der)
-        return valid
+        if algorithm == SignatureScheme.ECDSA_SECP256R1_SHA256:
+            pub_key = VerifyingKey.from_der(self.server_certs[0])
+            valid = pub_key.verify(signature, tbs, sha256, sigdecode=sigdecode_der)
+            return valid
+        else:
+            # not implemented
+            return True
 
 
     def handle_finished(self, finished_data, server_finished_key, msgs_so_far):
         handshake_type = finished_data[0]
 
-        FINISHED = 0x14
-        assert handshake_type == FINISHED
+        assert handshake_type == HandshakeType.FINISHED
 
         verify_data_len = bytes_to_num(finished_data[1:4])
         verify_data = finished_data[4:4+verify_data_len]
@@ -699,6 +710,11 @@ class ManualTls:
 
         return do_authenticated_encryption(client_write_key, client_write_iv, client_seq_num,
                                         HANDSHAKE, msg)
+
+    def generate_client_key(self):
+        self.client_key = SigningKey.generate(curve=NIST256p)
+        pub_key = self.client_key.verifying_key.to_string()
+        return pub_key[0:32], pub_key[32:64]
 
 
     def establish(self):
@@ -834,7 +850,7 @@ class ManualTls:
 
         ###########################
         print("Handshake: sending a change cipher msg")
-        self.send_tls(CHANGE_CIPHER, self.gen_change_cipher())
+        self.prepare_send_tls(CHANGE_CIPHER, self.gen_change_cipher())
 
         ###########################
         # All client messages beyond this point are encrypted
