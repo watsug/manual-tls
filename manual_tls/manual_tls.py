@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from enum import IntEnum
 from hashlib import sha256
 from ecdsa import VerifyingKey, SigningKey, NIST256p
-from ecdsa.util import sigdecode_der
+from ecdsa.util import sigdecode_der, sigencode_der
 
 # in tls 1.3 the version tls 1.2 is sent for better compatibility
 LEGACY_TLS_VERSION = b"\x03\x03"
@@ -374,12 +374,16 @@ class ManualComm(ABC):
 
 
 class ManualTls:
-    def __init__(self, comm: ManualComm) -> None:
+    def __init__(self) -> None:
+        pass
+
+    def initialize(self, comm: ManualComm):
         self.comm = comm
         self.server_certificate_type = 0
         self.client_certificate_type = 0
         self.signature_algorithms = []
-    
+        self.client_certificate_requested = False
+
     # NETWORK AND LOW LEVEL TLS PROTOCOL HELPERS
     def recv_num_bytes(self, num):
         ret = bytearray()
@@ -390,28 +394,25 @@ class ManualTls:
             ret += data
         return bytes(ret)
 
-
     def recv_tls(self):
         rec_type = self.recv_num_bytes(1)
-        #tls_version = self.recv_num_bytes(s, 2)
+        # tls_version = self.recv_num_bytes(s, 2)
         _ = self.recv_num_bytes(2)
-        
+
         # "The value of TLSPlaintext.legacy_record_version MUST be ignored by all implementations.""
-        #assert tls_version == LEGACY_TLS_VERSION
+        # assert tls_version == LEGACY_TLS_VERSION
 
         rec_len = bytes_to_num(self.recv_num_bytes(2))
         rec = self.recv_num_bytes(rec_len)
         return rec_type, rec
 
-
     def prepare_send_tls(self, rec_type, msg):
         tls_record = rec_type + LEGACY_TLS_VERSION + num_to_bytes(len(msg), 2) + msg
         self.comm.prepare_send(tls_record)
-        
+
     def send_tls(self, rec_type, msg):
         tls_record = rec_type + LEGACY_TLS_VERSION + num_to_bytes(len(msg), 2) + msg
         self.comm.sendall(tls_record)
-
 
     def recv_tls_and_decrypt(self, key, nonce, seq_num):
         rec_type, encrypted_msg = self.recv_tls()
@@ -425,9 +426,8 @@ class ManualTls:
         type = bytes_to_num(buff[offset : offset + 2])
         len = bytes_to_num(buff[offset + 2 : offset + 4])
         value = buff[offset + 4 : offset + 4 + len]
-        
-        return type, len, value
 
+        return type, len, value
 
     # PACKET GENERATORS AND HANDLERS
     def gen_client_hello(self, client_random, ecdh_pubkey_x, ecdh_pubkey_y):
@@ -509,7 +509,6 @@ class ManualTls:
 
         return client_hello_tlv
 
-
     def handle_server_hello(self, server_hello):
         handshake_type = server_hello[0]
 
@@ -568,12 +567,11 @@ class ManualTls:
 
         return server_random, session_id, public_ec_key_x, public_ec_key_y
 
-
     def handle_encrypted_extensions(self, msg):
         assert msg[0] == HandshakeType.ENCRYPTED_EXTENSIONS
         extensions_length = bytes_to_num(msg[1:4])
         assert len(msg[4:]) >= extensions_length
-        
+
         offset = 4
         extensions_length = bytes_to_num(msg[offset:offset + 2])
         offset += 2
@@ -581,14 +579,13 @@ class ManualTls:
             type, length, value = self.parse_extension(msg, offset)
             offset += length + 4
             extensions_length -= length + 4
-            
+
             print(f"        Encrypted_Extension: {ExtensionType(type).name} - {value.hex()}")
 
             if type == ExtensionType.SERVER_CERTIFICATE_TYPE:
                 self.server_certificate_type = value[0]
             elif type == ExtensionType.CLIENT_CERTIFICATE_TYPE:
                 self.client_certificate_type = value[0]
-
 
     def handle_cert_request(self, cert_request_data):
         offset = 0
@@ -607,14 +604,14 @@ class ManualTls:
         if context_len > 0:
             self.client_certificate_ctx = cert_request_data[offset : offset+context_len]
             offset += context_len
-        
+
         extensions_length = bytes_to_num(cert_request_data[offset:offset + 2])
         offset += 2
         while extensions_length > 0:
             type, length, value = self.parse_extension(cert_request_data, offset)
             offset += length + 4
             extensions_length -= length + 4
-            
+
             print(f"        Cert_request_extension: {ExtensionType(type).name} - {value.hex()}")
 
             if type == ExtensionType.SIGNATURE_ALGORITHMS:
@@ -628,10 +625,11 @@ class ManualTls:
         for alg in self.signature_algorithms:
             print(f"            Signature_alg: {hex(alg)} ({SignatureScheme(alg).name})")
 
+        self.client_certificate_requested = True
 
     def handle_server_cert(self, server_cert_data):
         p = Parser(server_cert_data)
-        
+
         handshake_type = p.get_uint8()
         assert handshake_type == HandshakeType.CERTIFICATE
 
@@ -652,17 +650,17 @@ class ManualTls:
             cert = p.get_data(cert_len)
             print(f"cert: {cert.hex()}")
             certificates.append(cert)
-            
+
             # skip extensions
             ext_len = p.get_uint16()
             if ext_len > 0:
                 _ = p.get_data(ext_len)
-            
+
         return certificates
 
     def handle_cert_verify(self, cert_verify_data, rsa, msgs_so_far):
         p = Parser(cert_verify_data)
-        
+
         handshake_type = p.get_uint8()
         assert handshake_type == HandshakeType.CERTIFICATE_VERIFY
 
@@ -686,7 +684,6 @@ class ManualTls:
             # not implemented
             return True
 
-
     def handle_finished(self, finished_data, server_finished_key, msgs_so_far):
         handshake_type = finished_data[0]
 
@@ -698,11 +695,9 @@ class ManualTls:
         hmac_digest = hmac_sha256(server_finished_key, one_shot_sha256(msgs_so_far))
         return verify_data == hmac_digest
 
-
     def gen_change_cipher(self):
         CHANGE_CIPHER_SPEC_MSG = b"\x01"
         return CHANGE_CIPHER_SPEC_MSG
-
 
     def gen_encrypted_finished(self, client_write_key, client_write_iv, client_seq_num, client_finish_val):
         FINISHED = b"\x14"
@@ -711,11 +706,72 @@ class ManualTls:
         return do_authenticated_encryption(client_write_key, client_write_iv, client_seq_num,
                                         HANDSHAKE, msg)
 
+    def gen_encrypted_client_certificate(
+        self, client_write_key, client_write_iv, client_seq_num
+    ):
+
+        spk = VerifyingKey.to_der(self.client_key.verifying_key)
+        certificate_entry = num_to_bytes(len(spk), 3) + spk + bytes(b"\x00\x00")
+        certificate = (
+            bytes(b"\x00") + num_to_bytes(len(certificate_entry), 3) + certificate_entry
+        )
+
+        msg = (
+            bytes([HandshakeType.CERTIFICATE])
+            + num_to_bytes(len(certificate), 3)
+            + certificate
+        )
+
+        return (
+            do_authenticated_encryption(
+                client_write_key, client_write_iv, client_seq_num, HANDSHAKE, msg
+            ),
+            msg,
+        )
+
+    def gen_encrypted_client_certificate_verify(
+        self, client_write_key, client_write_iv, client_seq_num, msgs_so_far
+    ):
+
+        digest = one_shot_sha256(msgs_so_far)
+        print(f"digest: {digest.hex()}")
+
+        tbs = b" " * 64 + b"TLS 1.3, client CertificateVerify" + b"\x00" + digest
+
+        signature = self.client_key.sign(tbs, hashfunc=sha256, sigencode=sigencode_der)
+        certificate_verify = (
+            num_to_bytes(SignatureScheme.ECDSA_SECP256R1_SHA256, 2)
+            + num_to_bytes(len(signature), 2)
+            + signature
+        )
+
+        msg = (
+            bytes([HandshakeType.CERTIFICATE_VERIFY])
+            + num_to_bytes(len(certificate_verify), 3)
+            + certificate_verify
+        )
+
+        return (
+            do_authenticated_encryption(
+                client_write_key, client_write_iv, client_seq_num, HANDSHAKE, msg
+            ),
+            msg,
+        )
+
     def generate_client_key(self):
         self.client_key = SigningKey.generate(curve=NIST256p)
         pub_key = self.client_key.verifying_key.to_string()
         return pub_key[0:32], pub_key[32:64]
 
+    def load_client_key(self, key_file):
+        with open(key_file, "r") as file:
+            pem = file.read()
+            self.client_key = SigningKey.from_pem(pem)
+            pub_key = self.client_key.verifying_key.to_string()
+            return pub_key[0:32], pub_key[32:64]
+
+    def is_client_certificate_requested(self) -> bool:
+        return self.client_certificate_requested
 
     def establish(self):
         print("Generating params for a client hello, the first message of TLS handshake")
@@ -808,9 +864,9 @@ class ManualTls:
             print(f"    Certificate_request: {server_cert.hex()}")
 
             self.handle_cert_request(server_cert)
-            
+
             msgs_so_far = msgs_so_far + server_cert
-            
+
             rec_type, server_cert = self.recv_tls_and_decrypt(server_write_key, server_write_iv, server_seq_num)
             assert rec_type == HANDSHAKE
             server_seq_num += 1
@@ -855,32 +911,56 @@ class ManualTls:
         ###########################
         # All client messages beyond this point are encrypted
         msgs_so_far = msgs_so_far + finished
+        transcript_hash = one_shot_sha256(msgs_so_far)
+
+        if self.is_client_certificate_requested():
+            client_certificate_msg, msg = self.gen_encrypted_client_certificate(
+                client_write_key, client_write_iv, client_seq_num
+            )
+            
+            if client_certificate_msg is not None:
+                self.prepare_send_tls(APPLICATION_DATA, client_certificate_msg)
+                client_seq_num += 1
+                msgs_so_far = msgs_so_far + msg
+
+            client_certificate_verify_msg, msg = (
+                self.gen_encrypted_client_certificate_verify(
+                    client_write_key, client_write_iv, client_seq_num, msgs_so_far
+                )
+            )
+
+            if client_certificate_verify_msg is not None:
+                self.prepare_send_tls(APPLICATION_DATA, client_certificate_verify_msg)
+                client_seq_num += 1
+                msgs_so_far = msgs_so_far + msg                
+
         msgs_sha256 = one_shot_sha256(msgs_so_far)
+
         client_finish_val = hmac_sha256(client_finished_key, msgs_sha256)
 
         print("Handshake: sending an encrypted finished msg")
-        encrypted_hangshake_msg = self.gen_encrypted_finished(client_write_key, client_write_iv, client_seq_num,
-                                                        client_finish_val)
+        encrypted_handshake_msg = self.gen_encrypted_finished(
+            client_write_key, client_write_iv, client_seq_num, client_finish_val
+        )
         print(f"    Client finish value {client_finish_val.hex()}")
-        self.send_tls(APPLICATION_DATA, encrypted_hangshake_msg)
+        self.send_tls(APPLICATION_DATA, encrypted_handshake_msg)
         client_seq_num += 1
 
         print("Handshake finished, regenerating secrets for application data")
 
         ###########################
-        # rederive application secrets
-        msgs_so_far_hash = one_shot_sha256(msgs_so_far)
+        # derive application secrets
         premaster_secret = derive_secret(b"derived", data=one_shot_sha256(b""), key=handshake_secret, hash_len=32)
         master_secret = hmac_sha256(key=premaster_secret, data=b"\x00" * 32)
-        server_secret = derive_secret(b"s ap traffic", data=msgs_so_far_hash, key=master_secret, hash_len=32)
+        server_secret = derive_secret(b"s ap traffic", data=transcript_hash, key=master_secret, hash_len=32)
         self.server_write_key = derive_secret(b"key", data=b"", key=server_secret, hash_len=16)
         self.server_write_iv = derive_secret(b"iv", data=b"", key=server_secret, hash_len=12)
-        client_secret = derive_secret(b"c ap traffic", data=msgs_so_far_hash, key=master_secret, hash_len=32)
+        client_secret = derive_secret(b"c ap traffic", data=transcript_hash, key=master_secret, hash_len=32)
         self.client_write_key = derive_secret(b"key", data=b"", key=client_secret, hash_len=16)
         self.client_write_iv = derive_secret(b"iv", data=b"", key=client_secret, hash_len=12)
 
-        print(f"    server_write_key {server_write_key.hex()} server_write_iv {server_write_iv.hex()}")
-        print(f"    client_write_key {client_write_key.hex()} client_write_iv {client_write_iv.hex()}")
+        print(f"    server_write_key {self.server_write_key.hex()} server_write_iv {self.server_write_iv.hex()}")
+        print(f"    client_write_key {self.client_write_key.hex()} client_write_iv {self.client_write_iv.hex()}")
 
         # reset sequence numbers
         self.client_seq_num = 0

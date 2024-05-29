@@ -12,7 +12,7 @@ class SocektComm(ManualComm):
         self.port = port
         self.timeout = timeout
         self.tx_buf = b""
-    
+
     def connect(self) -> None:
         self.s = socket.create_connection((self.host, self.port), self.timeout)
 
@@ -25,17 +25,21 @@ class SocektComm(ManualComm):
 
     def recv(self, bufsize: int) -> bytes:
         return self.s.recv(bufsize)
-    
+
 
 print(f"Connecting to {HOST}:{PORT}")
 comm = SocektComm(HOST, PORT, TIMEOUT)
 comm.connect()
 
-tls = ManualTls(comm)
+tls = ManualTls()
+tls.initialize(comm)
 
 pub_key_x, pub_key_y = tls.generate_client_key()
 
+print(f"pub_key_x: {pub_key_x.hex()}")
+print(f"pub_key_y: {pub_key_y.hex()}")
+
 tls.establish()
-resp = tls.transmit(REQUEST)
+resp = tls.transmit(b"\x00\x01")
 print(resp.decode(errors='ignore'))
 tls.transmit(None)
