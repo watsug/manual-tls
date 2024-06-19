@@ -1,10 +1,12 @@
-import base64
-
+import logging
 from abc import ABC, abstractmethod
 from enum import IntEnum
 from hashlib import sha256
-from ecdsa import VerifyingKey, SigningKey, NIST256p
+
+from ecdsa import NIST256p, SigningKey, VerifyingKey
 from ecdsa.util import sigdecode_der, sigencode_der
+
+logger = logging.getLogger(__name__)
 
 # in tls 1.3 the version tls 1.2 is sent for better compatibility
 LEGACY_TLS_VERSION = b"\x03\x03"
@@ -14,6 +16,7 @@ CHANGE_CIPHER = b"\x14"
 ALERT = b"\x15"
 HANDSHAKE = b"\x16"
 APPLICATION_DATA = b"\x17"
+
 
 class HandshakeType(IntEnum):
     HELLO_REQUEST = 0
@@ -36,6 +39,7 @@ class HandshakeType(IntEnum):
     SUPPLEMENTAL_DATA = 23
     KEY_UPDATE = 24
     MESSAGE_HASH = 254
+
 
 class ExtensionType(IntEnum):
     SERVER_NAME = 0                             # RFC 6066
@@ -61,44 +65,49 @@ class ExtensionType(IntEnum):
     SIGNATURE_ALGORITHMS_CERT = 50              # RFC 8446
     KEY_SHARE = 51                              # RFC 8446
 
+
 class SignatureScheme(IntEnum):
     # RSASSA-PKCS1-v1_5 algorithms
-    RSA_PKCS1_SHA256 = 0X0401
-    RSA_PKCS1_SHA384 = 0X0501
-    RSA_PKCS1_SHA512 = 0X0601
+    RSA_PKCS1_SHA256 = 0x0401
+    RSA_PKCS1_SHA384 = 0x0501
+    RSA_PKCS1_SHA512 = 0x0601
 
     # ECDSA algorithms
-    ECDSA_SECP256R1_SHA256 = 0X0403
-    ECDSA_SECP384R1_SHA384 = 0X0503
-    ECDSA_SECP521R1_SHA512 = 0X0603          
+    ECDSA_SECP256R1_SHA256 = 0x0403
+    ECDSA_SECP384R1_SHA384 = 0x0503
+    ECDSA_SECP521R1_SHA512 = 0x0603
 
     # RSASSA-PSS algorithms with public key OID rsaEncryption
-    RSA_PSS_RSAE_SHA256 = 0X0804
-    RSA_PSS_RSAE_SHA384 = 0X0805
-    RSA_PSS_RSAE_SHA512 = 0X0806
+    RSA_PSS_RSAE_SHA256 = 0x0804
+    RSA_PSS_RSAE_SHA384 = 0x0805
+    RSA_PSS_RSAE_SHA512 = 0x0806
 
     # EdDSA algorithms
-    ED25519 = 0X0807
-    ED448 = 0X0808
+    ED25519 = 0x0807
+    ED448 = 0x0808
 
     # RSASSA-PSS algorithms with public key OID RSASSA-PSS
-    RSA_PSS_PSS_SHA256 = 0X0809
-    RSA_PSS_PSS_SHA384 = 0X080A
-    RSA_PSS_PSS_SHA512 = 0X080B
+    RSA_PSS_PSS_SHA256 = 0x0809
+    RSA_PSS_PSS_SHA384 = 0x080A
+    RSA_PSS_PSS_SHA512 = 0x080B
 
     # Legacy algorithms
-    RSA_PKCS1_SHA1 = 0X0201
-    ECDSA_SHA1 = 0X0203
+    RSA_PKCS1_SHA1 = 0x0201
+    ECDSA_SHA1 = 0x0203
+
 
 # BYTE MANIPULATION HELPERS
 def bytes_to_num(b):
     return int.from_bytes(b, "big")
 
+
 def num_to_bytes(num, bytes_len):
     return int.to_bytes(num, bytes_len, "big")
 
+
 def rotr(num, count):
     return num >> count | num << (32 - count)
+
 
 def xor(a, b):
     return bytes(i ^ j for i, j in zip(a, b))
@@ -109,7 +118,7 @@ def mutliply_blocks(x, y):
     for i in range(128):
         if x & (1 << (127 - i)):
             z ^= y
-        y = (y >> 1) ^ (0xe1 << 120) if y & 1 else y >> 1
+        y = (y >> 1) ^ (0xE1 << 120) if y & 1 else y >> 1
     return z
 
 
@@ -118,7 +127,7 @@ def ghash(h, data):
 
     y = 0
     for pos in range(0, len(data), CHUNK_LEN):
-        chunk = bytes_to_num(data[pos: pos + CHUNK_LEN])
+        chunk = bytes_to_num(data[pos : pos + CHUNK_LEN])
         y = mutliply_blocks(y ^ chunk, h)
     return y
 
@@ -143,6 +152,7 @@ AES_SBOX = [
     65, 153, 45, 15, 176, 84, 187, 22
 ]
 
+
 def aes128_expand_key(key):
     RCON = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36]
 
@@ -160,6 +170,7 @@ def aes128_expand_key(key):
         for i in range(1, 4):
             enc_keys[t][i] = enc_keys[t][i-1] ^ prev_key[i]
     return enc_keys
+
 
 def aes128_encrypt(key, plaintext):
     TWOTIMES = [2*num if 2*num < 256 else 2*num & 0xff ^ 27 for num in range(256)]
@@ -195,7 +206,7 @@ def aes128_ctr_encrypt(key, msg, nonce, counter_start_val):
     ans = []
     counter = counter_start_val
     for s in range(0, len(msg), BLOCK_SIZE):
-        chunk = msg[s:s+BLOCK_SIZE]
+        chunk = msg[s : s + BLOCK_SIZE]
 
         chunk_nonce = nonce + num_to_bytes(counter, 4)
         encrypted_chunk_nonce = aes128_encrypt(key, chunk_nonce)
@@ -216,8 +227,14 @@ def calc_pretag(key, encrypted_msg, associated_data):
     u = b"\x00" * (16 * ((len(encrypted_msg) + 15) // 16) - len(encrypted_msg))
 
     h = bytes_to_num(aes128_encrypt(key, b"\x00" * 16))
-    data = (associated_data + v + encrypted_msg + u +
-            num_to_bytes(len(associated_data)*8, 8) + num_to_bytes(len(encrypted_msg)*8, 8))
+    data = (
+        associated_data
+        + v
+        + encrypted_msg
+        + u
+        + num_to_bytes(len(associated_data) * 8, 8)
+        + num_to_bytes(len(encrypted_msg) * 8, 8)
+    )
     return num_to_bytes(ghash(h, data), 16)
 
 
@@ -240,10 +257,12 @@ def aes128_gcm_encrypt(key, msg, nonce, associated_data):
     tag = aes128_ctr_encrypt(key, pretag, nonce, counter_start_val=1)
     return encrypted_msg + tag
 
+
 def one_shot_sha256(data):
     m = sha256()
     m.update(data)
     return m.digest()
+
 
 def hmac_sha256(key, data):
     BLOCK_SIZE = 512 // 8
@@ -259,8 +278,13 @@ def hmac_sha256(key, data):
 
 def derive_secret(label, key, data, hash_len):
     full_label = b"tls13 " + label
-    packed_data = (num_to_bytes(hash_len, 2) + num_to_bytes(len(full_label), 1) +
-                full_label + num_to_bytes(len(data), 1) + data)
+    packed_data = (
+        num_to_bytes(hash_len, 2)
+        + num_to_bytes(len(full_label), 1)
+        + full_label
+        + num_to_bytes(len(data), 1)
+        + data
+    )
 
     secret = bytearray()
     i = 1
@@ -284,14 +308,14 @@ def mod_inv(a, p):
 
 def add_two_ec_points(p1_x, p1_y, p2_x, p2_y, a, p):
     if p1_x == p2_x and p1_y == p2_y:
-        s = (3*p1_x*p1_x + a) * mod_inv(2*p2_y, p)
+        s = (3 * p1_x * p1_x + a) * mod_inv(2 * p2_y, p)
     elif p1_x != p2_x:
         s = (p1_y - p2_y) * mod_inv(p1_x - p2_x, p)
     else:
         raise NotImplementedError
 
-    x = s*s - p1_x - p2_x
-    y = -p1_y + s*(p1_x - x)
+    x = s * s - p1_x - p2_x
+    y = -p1_y + s * (p1_x - x)
     return x % p, y % p
 
 
@@ -311,7 +335,7 @@ def do_authenticated_encryption(key, nonce_base, seq_num, msg_type, payload):
 
     payload += msg_type
     nonce = xor(nonce_base, num_to_bytes(seq_num, 12))
-    data = APPLICATION_DATA + LEGACY_TLS_VERSION + num_to_bytes(len(payload)+TAG_LEN, 2)
+    data = APPLICATION_DATA + LEGACY_TLS_VERSION + num_to_bytes(len(payload) + TAG_LEN, 2)
 
     encrypted_msg = aes128_gcm_encrypt(key, payload, nonce, associated_data=data)
     return encrypted_msg
@@ -326,13 +350,15 @@ def do_authenticated_decryption(key, nonce_start, seq_num, msg_type, payload):
     msg_type, msg_data = msg[-1:], msg[:-1]
     return msg_type, msg_data
 
+
 class Extension:
     def __init__(self, type, value) -> None:
         self.type = type
-        self.value = value    
+        self.value = value
 
-class Parser:    
-    def __init__(self, buffer : bytes, offset = 0) -> None:
+
+class Parser:
+    def __init__(self, buffer: bytes, offset=0) -> None:
         self.buffer = buffer
         self.offset = offset
 
@@ -359,11 +385,12 @@ class Parser:
     def bytes_left(self):
         return len(self.buffer) - self.offset
 
+
 class ManualComm(ABC):
     @abstractmethod
     def prepare_send(self, data) -> None:
         pass
-    
+
     @abstractmethod
     def sendall(self, data) -> None:
         pass
@@ -419,7 +446,7 @@ class ManualTls:
         assert rec_type == APPLICATION_DATA
 
         msg_type, msg = do_authenticated_decryption(key, nonce, seq_num, APPLICATION_DATA, encrypted_msg)
-        print(f"Received handshake type: {msg[0]} ({HandshakeType(msg[0]).name})")
+        logger.debug(f"Received handshake type: {msg[0]} ({HandshakeType(msg[0]).name})")
         return msg_type, msg
 
     def parse_extension(self, buff, offset):
@@ -440,22 +467,34 @@ class ManualTls:
         supported_versions_length = b"\x00\x03"
         another_supported_versions_length = b"\x02"
         tls1_3_version = b"\x03\x04"
-        supported_version_extension = (supported_versions + supported_versions_length +
-                                    another_supported_versions_length + tls1_3_version)
+        supported_version_extension = (
+            supported_versions
+            + supported_versions_length
+            + another_supported_versions_length
+            + tls1_3_version
+        )
 
         signature_algos = b"\x00\x0d"
         signature_algos_length = b"\x00\x04"
         another_signature_algos_length = b"\x00\x02"
         rsa_pss_rsae_sha256_algo = b"\x08\x04"
-        signature_algos_extension = (signature_algos + signature_algos_length +
-                                    another_signature_algos_length + rsa_pss_rsae_sha256_algo)
+        signature_algos_extension = (
+            signature_algos
+            + signature_algos_length
+            + another_signature_algos_length
+            + rsa_pss_rsae_sha256_algo
+        )
 
         supported_groups = b"\x00\x0a"
         supported_groups_length = b"\x00\x04"
         another_supported_groups_length = b"\x00\x02"
         secp256r1_group = b"\x00\x17"
-        supported_groups_extension = (supported_groups + supported_groups_length +
-                                    another_supported_groups_length + secp256r1_group)
+        supported_groups_extension = (
+            supported_groups
+            + supported_groups_length
+            + another_supported_groups_length
+            + secp256r1_group
+        )
 
         ecdh_pubkey = b"\x04" + num_to_bytes(ecdh_pubkey_x, 32) + num_to_bytes(ecdh_pubkey_y, 32)
 
@@ -463,49 +502,65 @@ class ManualTls:
         key_share_length = num_to_bytes(len(ecdh_pubkey) + 4 + 2, 2)
         another_key_share_length = num_to_bytes(len(ecdh_pubkey) + 4, 2)
         key_exchange_len = num_to_bytes(len(ecdh_pubkey), 2)
-        key_share_extension = (key_share + key_share_length + another_key_share_length +
-                            secp256r1_group + key_exchange_len + ecdh_pubkey)
+        key_share_extension = (
+            key_share
+            + key_share_length
+            + another_key_share_length
+            + secp256r1_group
+            + key_exchange_len
+            + ecdh_pubkey
+        )
 
-        extensions = (supported_version_extension + signature_algos_extension +
-                    supported_groups_extension + key_share_extension)
+        extensions = (
+            supported_version_extension
+            + signature_algos_extension
+            + supported_groups_extension
+            + key_share_extension
+        )
 
-        client_hello_data = (LEGACY_TLS_VERSION + client_random +
-                            num_to_bytes(len(session_id), 1) + session_id +
-                            num_to_bytes(len(TLS_AES_128_GCM_SHA256), 2) + TLS_AES_128_GCM_SHA256 +
-                            num_to_bytes(len(compression_method), 1) + compression_method +
-                            num_to_bytes(len(extensions), 2)) + extensions
+        client_hello_data = (
+            LEGACY_TLS_VERSION
+            + client_random
+            + num_to_bytes(len(session_id), 1)
+            + session_id
+            + num_to_bytes(len(TLS_AES_128_GCM_SHA256), 2)
+            + TLS_AES_128_GCM_SHA256
+            + num_to_bytes(len(compression_method), 1)
+            + compression_method
+            + num_to_bytes(len(extensions), 2)
+        ) + extensions
 
         client_hello_len_bytes = num_to_bytes(len(client_hello_data), 3)
         client_hello_tlv = CLIENT_HELLO + client_hello_len_bytes + client_hello_data
 
-        print(f"    Type is the client hello: {CLIENT_HELLO.hex()}")
-        print(f"    Length is {len(client_hello_data)}: {client_hello_len_bytes.hex()}")
-        print(f"    Legacy client version is TLS 1.2: {LEGACY_TLS_VERSION.hex()}")
-        print(f"    Client random: {client_random.hex()}")
-        print(f"    Session id len is 0: {num_to_bytes(len(session_id), 1).hex()}")
-        print(f"    Session id: {session_id.hex()}")
-        print(f"    Cipher suites len is 2: {num_to_bytes(len(TLS_AES_128_GCM_SHA256), 2)}")
-        print(f"    Cipher suite is TLS_AES_128_GCM_SHA256: {TLS_AES_128_GCM_SHA256.hex()}")
-        print(f"    Compression method len is 1: {num_to_bytes(len(compression_method), 1).hex()}")
-        print(f"    Compression method is no compression: {compression_method.hex()}")
-        print(f"    Extensions len is {len(extensions)}: {num_to_bytes(len(extensions), 2).hex()}")
-        print(f"    Extension type is supported_versions: {supported_versions.hex()}")
-        print(f"        Extension len is 3: {supported_versions_length.hex()}")
-        print(f"        Extension field len is 2: {another_supported_versions_length.hex()}")
-        print(f"        Version is TLS 1.3: {tls1_3_version.hex()}")
-        print(f"    Extension type is signature_algos: {signature_algos.hex()}")
-        print(f"        Extension len is 4: {signature_algos_length.hex()}")
-        print(f"        Extension field len is 2: {another_signature_algos_length.hex()}")
-        print(f"        Algo is rsa_pss_rsae_sha256_algo: {rsa_pss_rsae_sha256_algo.hex()}")
-        print(f"    Extension type is supported_groups: {supported_groups.hex()}")
-        print(f"        Extension len is 4: {supported_groups_length.hex()}")
-        print(f"        Extension field len is 2: {another_supported_groups_length.hex()}")
-        print(f"        Group is secp256r1_group: {secp256r1_group.hex()}")
-        print(f"    Extension type is key_share: {key_share.hex()}")
-        print(f"        Extension len is {bytes_to_num(key_share_length)}: {key_share_length.hex()}")
-        print(f"        Extension field len is {bytes_to_num(another_key_share_length)}: {another_key_share_length.hex()}")
-        print(f"        Key length {len(ecdh_pubkey)}: {key_exchange_len.hex()}")
-        print(f"        Key is: {ecdh_pubkey.hex()}")
+        logger.debug(f"    Type is the client hello: {CLIENT_HELLO.hex()}")
+        logger.debug(f"    Length is {len(client_hello_data)}: {client_hello_len_bytes.hex()}")
+        logger.debug(f"    Legacy client version is TLS 1.2: {LEGACY_TLS_VERSION.hex()}")
+        logger.debug(f"    Client random: {client_random.hex()}")
+        logger.debug(f"    Session id len is 0: {num_to_bytes(len(session_id), 1).hex()}")
+        logger.debug(f"    Session id: {session_id.hex()}")
+        logger.debug(f"    Cipher suites len is 2: {num_to_bytes(len(TLS_AES_128_GCM_SHA256), 2)}")
+        logger.debug(f"    Cipher suite is TLS_AES_128_GCM_SHA256: {TLS_AES_128_GCM_SHA256.hex()}")
+        logger.debug(f"    Compression method len is 1: {num_to_bytes(len(compression_method), 1).hex()}")
+        logger.debug(f"    Compression method is no compression: {compression_method.hex()}")
+        logger.debug(f"    Extensions len is {len(extensions)}: {num_to_bytes(len(extensions), 2).hex()}")
+        logger.debug(f"    Extension type is supported_versions: {supported_versions.hex()}")
+        logger.debug(f"        Extension len is 3: {supported_versions_length.hex()}")
+        logger.debug(f"        Extension field len is 2: {another_supported_versions_length.hex()}")
+        logger.debug(f"        Version is TLS 1.3: {tls1_3_version.hex()}")
+        logger.debug(f"    Extension type is signature_algos: {signature_algos.hex()}")
+        logger.debug(f"        Extension len is 4: {signature_algos_length.hex()}")
+        logger.debug(f"        Extension field len is 2: {another_signature_algos_length.hex()}")
+        logger.debug(f"        Algo is rsa_pss_rsae_sha256_algo: {rsa_pss_rsae_sha256_algo.hex()}")
+        logger.debug(f"    Extension type is supported_groups: {supported_groups.hex()}")
+        logger.debug(f"        Extension len is 4: {supported_groups_length.hex()}")
+        logger.debug(f"        Extension field len is 2: {another_supported_groups_length.hex()}")
+        logger.debug(f"        Group is secp256r1_group: {secp256r1_group.hex()}")
+        logger.debug(f"    Extension type is key_share: {key_share.hex()}")
+        logger.debug(f"        Extension len is {bytes_to_num(key_share_length)}: {key_share_length.hex()}")
+        logger.debug(f"        Extension field len is {bytes_to_num(another_key_share_length)}: {another_key_share_length.hex()}")
+        logger.debug(f"        Key length {len(ecdh_pubkey)}: {key_exchange_len.hex()}")
+        logger.debug(f"        Key is: {ecdh_pubkey.hex()}")
 
         return client_hello_tlv
 
@@ -521,31 +576,40 @@ class ManualTls:
         server_random = server_hello[6:38]
 
         session_id_len = bytes_to_num(server_hello[38:39])
-        session_id = server_hello[39:39 + session_id_len]
+        session_id = server_hello[39 : 39 + session_id_len]
 
-        cipher_suite = server_hello[39 + session_id_len:39 + session_id_len + 2]
+        cipher_suite = server_hello[39 + session_id_len : 39 + session_id_len + 2]
         assert cipher_suite == TLS_AES_128_GCM_SHA256
 
-        compression_method = server_hello[39 + session_id_len + 2:39 + session_id_len + 3]
+        compression_method = server_hello[39 + session_id_len + 2 : 39 + session_id_len + 3]
 
-        extensions_length = bytes_to_num(server_hello[39 + session_id_len + 3:39 + session_id_len + 3 + 2])
-        extensions = server_hello[39 + session_id_len + 3 + 2:39 + session_id_len + 3 + 2 + extensions_length]
+        extensions_length = bytes_to_num(server_hello[39 + session_id_len + 3 : 39 + session_id_len + 3 + 2])
+        extensions = server_hello[
+            39
+            + session_id_len
+            + 3
+            + 2 : 39
+            + session_id_len
+            + 3
+            + 2
+            + extensions_length
+        ]
 
         public_ec_key = b""
         ptr = 0
         while ptr < extensions_length:
-            extension_type = extensions[ptr: ptr + 2]
-            extension_length = bytes_to_num(extensions[ptr+2: ptr + 4])
+            extension_type = extensions[ptr : ptr + 2]
+            extension_length = bytes_to_num(extensions[ptr + 2 : ptr + 4])
             KEY_SHARE = b"\x00\x33"
             if extension_type != KEY_SHARE:
                 ptr += extension_length + 4
                 continue
-            group = extensions[ptr+4: ptr+6]
+            group = extensions[ptr + 4 : ptr + 6]
             SECP256R1_GROUP = b"\x00\x17"
             assert group == SECP256R1_GROUP
-            key_exchange_len = bytes_to_num(extensions[ptr+6: ptr+8])
+            key_exchange_len = bytes_to_num(extensions[ptr + 6 : ptr + 8])
 
-            public_ec_key = extensions[ptr+8:ptr+8+key_exchange_len]
+            public_ec_key = extensions[ptr + 8 : ptr + 8 + key_exchange_len]
             break
 
         if not public_ec_key:
@@ -554,16 +618,16 @@ class ManualTls:
         public_ec_key_x = bytes_to_num(public_ec_key[1:33])
         public_ec_key_y = bytes_to_num(public_ec_key[33:])
 
-        print(f"    Type is the server hello: {server_hello[:1].hex()}")
-        print(f"    Length is {bytes_to_num(server_hello_len)}: {server_hello_len.hex()}")
-        print(f"    Legacy server version is TLS 1.2: {server_version.hex()}")
-        print(f"    Server random: {server_random.hex()}")
-        print(f"    Session id len is {session_id_len}: {server_hello[38:39].hex()}")
-        print(f"    Session id: {session_id.hex()}")
-        print(f"    Cipher suite is TLS_AES_128_GCM_SHA256: {cipher_suite.hex()}")
-        print(f"    Compression method is no compression: {compression_method.hex()}")
-        print(f"    Extensions len is {extensions_length}: {num_to_bytes(extensions_length, 2).hex()}")
-        print(f"    Extension parsing was skipped, but public_ec_key is {public_ec_key.hex()}")
+        logger.debug(f"    Type is the server hello: {server_hello[:1].hex()}")
+        logger.debug(f"    Length is {bytes_to_num(server_hello_len)}: {server_hello_len.hex()}")
+        logger.debug(f"    Legacy server version is TLS 1.2: {server_version.hex()}")
+        logger.debug(f"    Server random: {server_random.hex()}")
+        logger.debug(f"    Session id len is {session_id_len}: {server_hello[38:39].hex()}")
+        logger.debug(f"    Session id: {session_id.hex()}")
+        logger.debug(f"    Cipher suite is TLS_AES_128_GCM_SHA256: {cipher_suite.hex()}")
+        logger.debug(f"    Compression method is no compression: {compression_method.hex()}")
+        logger.debug(f"    Extensions len is {extensions_length}: {num_to_bytes(extensions_length, 2).hex()}")
+        logger.debug(f"    Extension parsing was skipped, but public_ec_key is {public_ec_key.hex()}")
 
         return server_random, session_id, public_ec_key_x, public_ec_key_y
 
@@ -573,14 +637,14 @@ class ManualTls:
         assert len(msg[4:]) >= extensions_length
 
         offset = 4
-        extensions_length = bytes_to_num(msg[offset:offset + 2])
+        extensions_length = bytes_to_num(msg[offset : offset + 2])
         offset += 2
         while extensions_length > 0:
             type, length, value = self.parse_extension(msg, offset)
             offset += length + 4
             extensions_length -= length + 4
 
-            print(f"        Encrypted_Extension: {ExtensionType(type).name} - {value.hex()}")
+            logger.debug(f"        Encrypted_Extension: {ExtensionType(type).name} - {value.hex()}")
 
             if type == ExtensionType.SERVER_CERTIFICATE_TYPE:
                 self.server_certificate_type = value[0]
@@ -602,17 +666,17 @@ class ManualTls:
         context_len = cert_request_data[offset]
         offset += 1
         if context_len > 0:
-            self.client_certificate_ctx = cert_request_data[offset : offset+context_len]
+            self.client_certificate_ctx = cert_request_data[offset : offset + context_len]
             offset += context_len
 
-        extensions_length = bytes_to_num(cert_request_data[offset:offset + 2])
+        extensions_length = bytes_to_num(cert_request_data[offset : offset + 2])
         offset += 2
         while extensions_length > 0:
             type, length, value = self.parse_extension(cert_request_data, offset)
             offset += length + 4
             extensions_length -= length + 4
 
-            print(f"        Cert_request_extension: {ExtensionType(type).name} - {value.hex()}")
+            logger.debug(f"        Cert_request_extension: {ExtensionType(type).name} - {value.hex()}")
 
             if type == ExtensionType.SIGNATURE_ALGORITHMS:
                 sig_scheme_length = bytes_to_num(value[:2])
@@ -623,7 +687,7 @@ class ManualTls:
                     self.signature_algorithms.append(alg)
 
         for alg in self.signature_algorithms:
-            print(f"            Signature_alg: {hex(alg)} ({SignatureScheme(alg).name})")
+            logger.debug(f"            Signature_alg: {hex(alg)} ({SignatureScheme(alg).name})")
 
         self.client_certificate_requested = True
 
@@ -648,7 +712,7 @@ class ManualTls:
         while p.bytes_left() > 0:
             cert_len = p.get_uint24()
             cert = p.get_data(cert_len)
-            print(f"cert: {cert.hex()}")
+            logger.debug(f"cert: {cert.hex()}")
             certificates.append(cert)
 
             # skip extensions
@@ -668,13 +732,18 @@ class ManualTls:
         assert cert_verify_len == p.bytes_left()
 
         algorithm = p.get_uint16()
-        print(f"        algorithm: {hex(algorithm)} ({SignatureScheme(algorithm).name})")
+        logger.debug(f"        algorithm: {hex(algorithm)} ({SignatureScheme(algorithm).name})")
         signature_len = p.get_uint16()
         signature = p.get_data(signature_len)
-        print(f"        signature: {signature.hex()}")
-        print(f"        msgs_so_far: {msgs_so_far.hex()}")
+        logger.debug(f"        signature: {signature.hex()}")
+        logger.debug(f"        msgs_so_far: {msgs_so_far.hex()}")
 
-        tbs = b" " * 64 + b"TLS 1.3, server CertificateVerify" + b"\x00" + one_shot_sha256(msgs_so_far)
+        tbs = (
+            b" " * 64
+            + b"TLS 1.3, server CertificateVerify"
+            + b"\x00"
+            + one_shot_sha256(msgs_so_far)
+        )
 
         if algorithm == SignatureScheme.ECDSA_SECP256R1_SHA256:
             pub_key = VerifyingKey.from_der(self.server_certs[0])
@@ -690,7 +759,7 @@ class ManualTls:
         assert handshake_type == HandshakeType.FINISHED
 
         verify_data_len = bytes_to_num(finished_data[1:4])
-        verify_data = finished_data[4:4+verify_data_len]
+        verify_data = finished_data[4 : 4 + verify_data_len]
 
         hmac_digest = hmac_sha256(server_finished_key, one_shot_sha256(msgs_so_far))
         return verify_data == hmac_digest
@@ -703,8 +772,7 @@ class ManualTls:
         FINISHED = b"\x14"
         msg = FINISHED + num_to_bytes(len(client_finish_val), 3) + client_finish_val
 
-        return do_authenticated_encryption(client_write_key, client_write_iv, client_seq_num,
-                                        HANDSHAKE, msg)
+        return do_authenticated_encryption(client_write_key, client_write_iv, client_seq_num, HANDSHAKE, msg)
 
     def gen_encrypted_client_certificate(
         self, client_write_key, client_write_iv, client_seq_num
@@ -734,7 +802,7 @@ class ManualTls:
     ):
 
         digest = one_shot_sha256(msgs_so_far)
-        print(f"digest: {digest.hex()}")
+        logger.debug(f"digest: {digest.hex()}")
 
         tbs = b" " * 64 + b"TLS 1.3, client CertificateVerify" + b"\x00" + digest
 
@@ -774,53 +842,60 @@ class ManualTls:
         return self.client_certificate_requested
 
     def establish(self):
-        print("Generating params for a client hello, the first message of TLS handshake")
-        SECP256R1_P = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff
-        SECP256R1_A = 0xffffffff00000001000000000000000000000000fffffffffffffffffffffffc
-        SECP256R1_G = (0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296,
-                    0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5)
+        logger.debug("Generating params for a client hello, the first message of TLS handshake")
+        SECP256R1_P = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF
+        SECP256R1_A = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFC
+        SECP256R1_G = (
+            0x6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296,
+            0x4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5,
+        )
 
         client_random = b"\xAB" * 32
         our_ecdh_privkey = 42
-        our_ecdh_pubkey_x, our_ecdh_pubkey_y = (
-            multiply_num_on_ec_point(our_ecdh_privkey, SECP256R1_G[0], SECP256R1_G[1], SECP256R1_A, SECP256R1_P)
+        our_ecdh_pubkey_x, our_ecdh_pubkey_y = multiply_num_on_ec_point(
+            our_ecdh_privkey, SECP256R1_G[0], SECP256R1_G[1], SECP256R1_A, SECP256R1_P
         )
 
-        print(f"    Client random: {client_random.hex()}")
-        print(f"    Our ECDH (Elliptic-curve Diffie-Hellman) private key: {our_ecdh_privkey}")
-        print(f"    Our ECDH public key: x={our_ecdh_pubkey_x} y={our_ecdh_pubkey_y}")
+        logger.debug(f"    Client random: {client_random.hex()}")
+        logger.debug(f"    Our ECDH (Elliptic-curve Diffie-Hellman) private key: {our_ecdh_privkey}")
+        logger.debug(f"    Our ECDH public key: x={our_ecdh_pubkey_x} y={our_ecdh_pubkey_y}")
 
-        print("Generating the client hello")
+        logger.debug("Generating the client hello")
         client_hello = self.gen_client_hello(client_random, our_ecdh_pubkey_x, our_ecdh_pubkey_y)
 
-        print("Sending the client hello")
+        logger.debug("Sending the client hello")
         self.send_tls(HANDSHAKE, client_hello)
 
         ###########################
-        print("Receiving a server hello")
+        logger.debug("Receiving a server hello")
         rec_type, server_hello = self.recv_tls()
 
         if rec_type == ALERT:
-            print("Server sent us ALERT, it probably doesn't support TLS_AES_128_GCM_SHA256 algo")
+            logger.error("Server sent us ALERT, it probably doesn't support TLS_AES_128_GCM_SHA256 algo")
             exit(1)
 
         assert rec_type == HANDSHAKE
 
         server_random, session_id, server_ecdh_pubkey_x, server_ecdh_pubkey_y = self.handle_server_hello(server_hello)
-        print(f"    Server ECDH public key: x={server_ecdh_pubkey_x} y={server_ecdh_pubkey_y}")
+        logger.debug(f"    Server ECDH public key: x={server_ecdh_pubkey_x} y={server_ecdh_pubkey_y}")
 
         ###########################
-        print("Receiving a change cipher msg, all communication will be encrypted")
+        logger.debug("Receiving a change cipher msg, all communication will be encrypted")
         rec_type, server_change_cipher = self.recv_tls()
         assert rec_type == CHANGE_CIPHER
 
         self.server_ecdh_pubkey_x = server_ecdh_pubkey_x
         self.server_ecdh_pubkey_y = server_ecdh_pubkey_y
 
-        our_secret_point_x = multiply_num_on_ec_point(our_ecdh_privkey, server_ecdh_pubkey_x, server_ecdh_pubkey_y,
-                                                    SECP256R1_A, SECP256R1_P)[0]
+        our_secret_point_x = multiply_num_on_ec_point(
+            our_ecdh_privkey,
+            server_ecdh_pubkey_x,
+            server_ecdh_pubkey_y,
+            SECP256R1_A,
+            SECP256R1_P,
+        )[0]
         our_secret = num_to_bytes(our_secret_point_x, 32)
-        print(f"    Our common ECDH secret is: {our_secret.hex()}, deriving keys")
+        logger.debug(f"    Our common ECDH secret is: {our_secret.hex()}, deriving keys")
 
         early_secret = hmac_sha256(key=b"", data=b"\x00" * 32)
         preextractsec = derive_secret(b"derived", key=early_secret, data=one_shot_sha256(b""), hash_len=32)
@@ -835,33 +910,33 @@ class ManualTls:
         client_write_iv = derive_secret(b"iv", key=client_hs_secret, data=b"", hash_len=12)
         client_finished_key = derive_secret(b"finished", key=client_hs_secret, data=b"", hash_len=32)
 
-        print(f"    server_write_key {server_write_key.hex()} server_write_iv {server_write_iv.hex()}")
-        print(f"    server_finished_key {server_finished_key.hex()}")
-        print(f"    client_write_key {client_write_key.hex()} client_write_iv {client_write_iv.hex()}")
-        print(f"    client_finished_key {client_finished_key.hex()}")
+        logger.debug(f"    server_write_key {server_write_key.hex()} server_write_iv {server_write_iv.hex()}")
+        logger.debug(f"    server_finished_key {server_finished_key.hex()}")
+        logger.debug(f"    client_write_key {client_write_key.hex()} client_write_iv {client_write_iv.hex()}")
+        logger.debug(f"    client_finished_key {client_finished_key.hex()}")
 
         client_seq_num = 0  # for use in authenticated encryption
         server_seq_num = 0
 
         ###########################
-        print("Receiving encrypted extensions")
+        logger.debug("Receiving encrypted extensions")
         rec_type, encrypted_extensions = self.recv_tls_and_decrypt(server_write_key, server_write_iv, server_seq_num)
         assert rec_type == HANDSHAKE
         server_seq_num += 1
 
-        print(f"    Encrypted_extensions: {encrypted_extensions.hex()}")
+        logger.debug(f"    Encrypted_extensions: {encrypted_extensions.hex()}")
         self.handle_encrypted_extensions(encrypted_extensions)
 
         msgs_so_far = client_hello + server_hello + encrypted_extensions
 
         ###########################
-        print("Receiving server certificates")
+        logger.debug("Receiving server certificates")
         rec_type, server_cert = self.recv_tls_and_decrypt(server_write_key, server_write_iv, server_seq_num)
         assert rec_type == HANDSHAKE
         server_seq_num += 1
 
         if server_cert[0] == HandshakeType.CERTIFICATE_REQUEST:
-            print(f"    Certificate_request: {server_cert.hex()}")
+            logger.debug(f"    Certificate_request: {server_cert.hex()}")
 
             self.handle_cert_request(server_cert)
 
@@ -871,28 +946,28 @@ class ManualTls:
             assert rec_type == HANDSHAKE
             server_seq_num += 1
 
-        print(f"    Certificate: {server_cert.hex()}")
+        logger.debug(f"    Certificate: {server_cert.hex()}")
 
         self.server_certs = self.handle_server_cert(server_cert)
-        print(f"    Got {len(self.server_certs)} certs")
+        logger.debug(f"    Got {len(self.server_certs)} certs")
 
         msgs_so_far = msgs_so_far + server_cert
 
         ###########################
-        print("Receiving server verify certificate")
+        logger.debug("Receiving server verify certificate")
         rec_type, cert_verify = self.recv_tls_and_decrypt(server_write_key, server_write_iv, server_seq_num)
         assert rec_type == HANDSHAKE
         server_seq_num += 1
 
-        print(f"    Certificate_verify: {cert_verify.hex()}")
+        logger.debug(f"    Certificate_verify: {cert_verify.hex()}")
 
         cert_ok = self.handle_cert_verify(cert_verify, None, msgs_so_far)
-        print(f"    Certificate verifying ststus: {cert_ok}")
+        logger.debug(f"    Certificate verifying ststus: {cert_ok}")
         if not cert_ok:
-            raise Exception("Unable to verify server certificate!") 
+            raise Exception("Unable to verify server certificate!")
 
         ###########################
-        print("Receiving server finished")
+        logger.debug("Receiving server finished")
         rec_type, finished = self.recv_tls_and_decrypt(server_write_key, server_write_iv, server_seq_num)
         assert rec_type == HANDSHAKE
         server_seq_num += 1
@@ -900,12 +975,12 @@ class ManualTls:
         msgs_so_far = msgs_so_far + cert_verify
         srv_finish_ok = self.handle_finished(finished, server_finished_key, msgs_so_far)
         if srv_finish_ok:
-            print("    Server sent valid finish handshake msg")
+            logger.debug("    Server sent valid finish handshake msg")
         else:
-            print("    Warning: Server sent wrong handshake finished msg")
+            logger.warning("    Warning: Server sent wrong handshake finished msg")
 
         ###########################
-        print("Handshake: sending a change cipher msg")
+        logger.debug("Handshake: sending a change cipher msg")
         self.prepare_send_tls(CHANGE_CIPHER, self.gen_change_cipher())
 
         ###########################
@@ -917,7 +992,7 @@ class ManualTls:
             client_certificate_msg, msg = self.gen_encrypted_client_certificate(
                 client_write_key, client_write_iv, client_seq_num
             )
-            
+
             if client_certificate_msg is not None:
                 self.prepare_send_tls(APPLICATION_DATA, client_certificate_msg)
                 client_seq_num += 1
@@ -932,21 +1007,21 @@ class ManualTls:
             if client_certificate_verify_msg is not None:
                 self.prepare_send_tls(APPLICATION_DATA, client_certificate_verify_msg)
                 client_seq_num += 1
-                msgs_so_far = msgs_so_far + msg                
+                msgs_so_far = msgs_so_far + msg
 
         msgs_sha256 = one_shot_sha256(msgs_so_far)
 
         client_finish_val = hmac_sha256(client_finished_key, msgs_sha256)
 
-        print("Handshake: sending an encrypted finished msg")
+        logger.debug("Handshake: sending an encrypted finished msg")
         encrypted_handshake_msg = self.gen_encrypted_finished(
             client_write_key, client_write_iv, client_seq_num, client_finish_val
         )
-        print(f"    Client finish value {client_finish_val.hex()}")
+        logger.debug(f"    Client finish value {client_finish_val.hex()}")
         self.send_tls(APPLICATION_DATA, encrypted_handshake_msg)
         client_seq_num += 1
 
-        print("Handshake finished, regenerating secrets for application data")
+        logger.debug("Handshake finished, regenerating secrets for application data")
 
         ###########################
         # derive application secrets
@@ -959,31 +1034,36 @@ class ManualTls:
         self.client_write_key = derive_secret(b"key", data=b"", key=client_secret, hash_len=16)
         self.client_write_iv = derive_secret(b"iv", data=b"", key=client_secret, hash_len=12)
 
-        print(f"    server_write_key {self.server_write_key.hex()} server_write_iv {self.server_write_iv.hex()}")
-        print(f"    client_write_key {self.client_write_key.hex()} client_write_iv {self.client_write_iv.hex()}")
+        logger.debug(f"    server_write_key {self.server_write_key.hex()} server_write_iv {self.server_write_iv.hex()}")
+        logger.debug(f"    client_write_key {self.client_write_key.hex()} client_write_iv {self.client_write_iv.hex()}")
 
         # reset sequence numbers
         self.client_seq_num = 0
         self.server_seq_num = 0
 
-    def transmit(self, data = None):
+    def transmit(self, data=None):
         ###########################
         # the rest is just for fun
-        print(f"Sending {data}")
+        logger.debug(f"Sending {data}")
 
         if data is not None:
-            encrypted_msg = do_authenticated_encryption(self.client_write_key, self.client_write_iv,
-                                                        self.client_seq_num, APPLICATION_DATA, data)
+            encrypted_msg = do_authenticated_encryption(
+                self.client_write_key,
+                self.client_write_iv,
+                self.client_seq_num,
+                APPLICATION_DATA,
+                data,
+            )
             self.send_tls(APPLICATION_DATA, encrypted_msg)
             self.client_seq_num += 1
 
-        print("Receiving an answer")
+        logger.debug("Receiving an answer")
         while True:
             try:
                 rec_type, msg = self.recv_tls_and_decrypt(self.server_write_key, self.server_write_iv, self.server_seq_num)
                 self.server_seq_num += 1
             except BrokenPipeError:
-                print("Connection closed on TCP level")
+                logger.warning("Connection closed on TCP level")
                 break
 
             if rec_type == APPLICATION_DATA:
@@ -991,14 +1071,14 @@ class ManualTls:
             elif rec_type == HANDSHAKE:
                 NEW_SESSION_TICKET = 4
                 if msg[0] == NEW_SESSION_TICKET:
-                    print(f"New session ticket: {msg.hex()}")
+                    logger.debug(f"New session ticket: {msg.hex()}")
             elif rec_type == ALERT:
                 alert_level, alert_description = msg
 
-                print(f"Got alert level: {alert_level}, description: {alert_description}")
+                logger.warning(f"Got alert level: {alert_level}, description: {alert_description}")
                 CLOSE_NOTIFY = 0
                 if alert_description == CLOSE_NOTIFY:
-                    print("Server sent close_notify, no waiting for more data")
+                    logger.info("Server sent close_notify, no waiting for more data")
                     break
             else:
-                print("Got msg with unknown rec_type", rec_type)
+                logger.warning("Got msg with unknown rec_type", rec_type)
