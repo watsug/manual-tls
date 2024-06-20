@@ -2,6 +2,9 @@ import logging
 from abc import ABC, abstractmethod
 from enum import IntEnum
 from hashlib import sha256
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
 
 from ecdsa import NIST256p, SigningKey, VerifyingKey
 from ecdsa.util import sigdecode_der, sigencode_der
@@ -94,6 +97,11 @@ class SignatureScheme(IntEnum):
     # Legacy algorithms
     RSA_PKCS1_SHA1 = 0x0201
     ECDSA_SHA1 = 0x0203
+
+
+class CertificateType(IntEnum):
+    X509 = 0
+    RAW_PUBLIC_KEY = 2
 
 
 # BYTE MANIPULATION HELPERS
@@ -404,12 +412,13 @@ class ManualTls:
     def __init__(self) -> None:
         pass
 
-    def initialize(self, comm: ManualComm):
+    def initialize(self, comm: ManualComm, cert_type: CertificateType):
         self.comm = comm
         self.server_certificate_type = 0
         self.client_certificate_type = 0
         self.signature_algorithms = []
         self.client_certificate_requested = False
+        self.cert_type = cert_type
 
     # NETWORK AND LOW LEVEL TLS PROTOCOL HELPERS
     def recv_num_bytes(self, num):
@@ -837,6 +846,12 @@ class ManualTls:
             self.client_key = SigningKey.from_pem(pem)
             pub_key = self.client_key.verifying_key.to_string()
             return pub_key[0:32], pub_key[32:64]
+
+    def load_client_certificate(self, cert_file):
+        with open(cert_file, "r") as file:
+            pem = file.read()
+            cert = x509.load_pem_x509_certificate(bytes(pem, "ASCII"), default_backend())
+            self.client_cert = cert.public_bytes(serialization.Encoding.DER)
 
     def is_client_certificate_requested(self) -> bool:
         return self.client_certificate_requested
