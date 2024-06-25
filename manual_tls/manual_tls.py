@@ -412,13 +412,14 @@ class ManualTls:
     def __init__(self) -> None:
         pass
 
-    def initialize(self, comm: ManualComm, cert_type: CertificateType):
+    def initialize(self, comm: ManualComm, client_cert_type: CertificateType, server_cert_type: CertificateType):
         self.comm = comm
         self.server_certificate_type = 0
         self.client_certificate_type = 0
         self.signature_algorithms = []
         self.client_certificate_requested = False
-        self.cert_type = cert_type
+        self.client_cert_type = client_cert_type
+        self.server_cert_type = server_cert_type
 
     # NETWORK AND LOW LEVEL TLS PROTOCOL HELPERS
     def recv_num_bytes(self, num):
@@ -465,6 +466,9 @@ class ManualTls:
 
         return type, len, value
 
+    def build_extension(self, type: ExtensionType, data: bytes) -> bytes:
+        return num_to_bytes(type, 2) + num_to_bytes(len(data), 2) + data
+
     # PACKET GENERATORS AND HANDLERS
     def gen_client_hello(self, client_random, ecdh_pubkey_x, ecdh_pubkey_y):
         CLIENT_HELLO = b"\x01"
@@ -505,6 +509,12 @@ class ManualTls:
             + secp256r1_group
         )
 
+        client_certificate_types = b"\x01" + num_to_bytes(self.client_cert_type, 1)
+        client_certificate_extension = self.build_extension(ExtensionType.CLIENT_CERTIFICATE_TYPE, client_certificate_types)
+
+        server_certificate_types = b"\x01" + num_to_bytes(self.server_cert_type, 1)
+        server_certificate_extension = self.build_extension(ExtensionType.SERVER_CERTIFICATE_TYPE, server_certificate_types)
+
         ecdh_pubkey = b"\x04" + num_to_bytes(ecdh_pubkey_x, 32) + num_to_bytes(ecdh_pubkey_y, 32)
 
         key_share = b"\x00\x33"
@@ -525,6 +535,8 @@ class ManualTls:
             + signature_algos_extension
             + supported_groups_extension
             + key_share_extension
+            + client_certificate_extension
+            + server_certificate_extension
         )
 
         client_hello_data = (
@@ -755,7 +767,17 @@ class ManualTls:
         )
 
         if algorithm == SignatureScheme.ECDSA_SECP256R1_SHA256:
-            pub_key = VerifyingKey.from_der(self.server_certs[0])
+            
+            if self.server_cert_type == CertificateType.RAW_PUBLIC_KEY:
+                pub_key = VerifyingKey.from_der(self.server_certs[0])
+            elif self.server_cert_type == CertificateType.X509:
+                cert = x509.load_der_x509_certificate(self.server_certs[0])
+                raw_pub_key = cert.public_key()
+                raw_pub_key = raw_pub_key.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+                pub_key = VerifyingKey.from_der(raw_pub_key)
+            else:
+                raise NotImplementedError
+            
             valid = pub_key.verify(signature, tbs, sha256, sigdecode=sigdecode_der)
             return valid
         else:
@@ -787,8 +809,14 @@ class ManualTls:
         self, client_write_key, client_write_iv, client_seq_num
     ):
 
-        spk = VerifyingKey.to_der(self.client_key.verifying_key)
-        certificate_entry = num_to_bytes(len(spk), 3) + spk + bytes(b"\x00\x00")
+        if self.client_cert_type == CertificateType.RAW_PUBLIC_KEY:
+            spk = VerifyingKey.to_der(self.client_key.verifying_key)
+            certificate_entry = num_to_bytes(len(spk), 3) + spk + bytes(b"\x00\x00")
+        elif self.client_cert_type == CertificateType.X509:
+            certificate_entry = num_to_bytes(len(self.client_cert), 3) + self.client_cert + bytes(b"\x00\x00")
+        else:
+            raise NotImplementedError
+
         certificate = (
             bytes(b"\x00") + num_to_bytes(len(certificate_entry), 3) + certificate_entry
         )

@@ -37,15 +37,13 @@ comm.connect()
 
 
 tls = ManualTls()
-#tls_type = CertificateType.RAW_PUBLIC_KEY
-tls_type = CertificateType.X509
-tls.initialize(comm, tls_type)
+client_cert_type = CertificateType.X509
+server_cert_type = CertificateType.X509
+tls.initialize(comm, client_cert_type, server_cert_type)
 
-if tls_type == CertificateType.RAW_PUBLIC_KEY:
-    pub_key_x, pub_key_y = tls.generate_client_key()
-else:
+pub_key_x, pub_key_y = tls.load_client_key("./certs/watsug.key")
+if client_cert_type == CertificateType.X509:
     tls.load_client_certificate("./certs/watsug.crt")
-    pub_key_x, pub_key_y = tls.load_client_key("./certs/watsug.key")
 
 logging.info(f"pub_key_x: {pub_key_x.hex()}")
 logging.info(f"pub_key_y: {pub_key_y.hex()}")
