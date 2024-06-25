@@ -412,7 +412,9 @@ class ManualTls:
     def __init__(self) -> None:
         pass
 
-    def initialize(self, comm: ManualComm, client_cert_type: CertificateType, server_cert_type: CertificateType):
+    def initialize(self, comm: ManualComm,
+                   client_cert_type: CertificateType = CertificateType.RAW_PUBLIC_KEY, 
+                   server_cert_type: CertificateType = CertificateType.RAW_PUBLIC_KEY):
         self.comm = comm
         self.server_certificate_type = 0
         self.client_certificate_type = 0
